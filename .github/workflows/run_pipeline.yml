@@ -1,0 +1,80 @@
+name: Run PySpark Kaggle Pipeline
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+  schedule:
+    - cron: "0 7 * * 1"  # Mondays at 07:00 UTC
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Configure Kaggle
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          if [[ -z "$KAGGLE_USERNAME" || -z "$KAGGLE_KEY" ]]; then
+            echo "Kaggle secrets not set; exiting."
+            exit 1
+          fi
+          mkdir -p ~/.kaggle
+          printf '{"username":"%s","key":"%s"}' "$KAGGLE_USERNAME" "$KAGGLE_KEY" > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: Run pipeline (sample for speed on CI)
+        env:
+          TRAIN_SAMPLE_FRACTION: "0.02"
+          HASH_BINS: "262144"
+        run: |
+          python main.py --data_dir data --train --infer
+
+      - name: Collect submission artifact
+        run: |
+          mkdir -p submissions_out
+          latest=$(ls -dt submissions/submission_* | head -n1)
+          cp $latest/*.csv submissions_out/submission.csv || true
+
+      - name: Upload submission artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: submission
+          path: submissions_out/submission.csv
+          if-no-files-found: warn
+
+      - name: Commit submission back to repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          latest=$(ls -dt submissions/submission_* | head -n1)
+          if [ -d "$latest" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add $latest
+            git commit -m "Add submission: $(basename $latest)" || echo "Nothing to commit"
+            git push
+          else
+            echo "No submission folder found to commit."

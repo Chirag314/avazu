@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.sqlite3
+*.egg-info/
+.venv/
+.conda/
+.env
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Data & artifacts
+data/*
+!data/.gitkeep
+logs/*
+!logs/.gitkeep
+.submissions_tmp/
+spark-warehouse/
+metastore_db/
+
+# Kaggle credentials (use GitHub Actions secrets instead)
+.kaggle/
+kaggle.json
+
+# OS
+.DS_Store
+Thumbs.db

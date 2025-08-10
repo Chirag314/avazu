@@ -1,9 +1,9 @@
-from typing import Tuple
+﻿from typing import Tuple
 from pyspark.sql import functions as F
 from pyspark.ml.classification import LogisticRegression
 from pyspark.ml import Pipeline
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
-from logging.logger import get_logger
+from app_logging.logger import get_logger
 from feature_engineering import build_feature_pipeline, prepare_dataframe
 
 logger = get_logger(__name__)

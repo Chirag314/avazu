@@ -11,6 +11,16 @@ jobs:
   run-pipeline:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+
+    # ✅ Define secrets once here; steps inherit them (VS Code warnings go away)
+    env:
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }} # optional
+
+    permissions:
+      contents: write   # needed for committing submission back to repo
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,19 +42,27 @@ jobs:
           pip install -r requirements.txt
 
       - name: Configure Kaggle
-        env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
-          if [[ -z "$KAGGLE_USERNAME" || -z "$KAGGLE_KEY" ]]; then
-            echo "Kaggle secrets not set; exiting."
+          if [[ -z "${KAGGLE_USERNAME:-}" || -z "${KAGGLE_KEY:-}" ]]; then
+            echo "❌ Kaggle secrets not set; exiting."
             exit 1
           fi
           mkdir -p ~/.kaggle
           printf '{"username":"%s","key":"%s"}' "$KAGGLE_USERNAME" "$KAGGLE_KEY" > ~/.kaggle/kaggle.json
           chmod 600 ~/.kaggle/kaggle.json
 
-      - name: Run pipeline (sample for speed on CI)
+      - name: Download Kaggle data
+        run: |
+          pip install kaggle
+          mkdir -p data
+          kaggle competitions download -c neurips-2025-open-polymer-prediction -p data
+          shopt -s nullglob
+          for z in data/*.zip; do
+            echo "Unzipping $z"
+            unzip -o "$z" -d data
+          done
+
+      - name: Run pipeline (sample fraction on CI)
         env:
           TRAIN_SAMPLE_FRACTION: "0.02"
           HASH_BINS: "262144"
@@ -54,8 +72,12 @@ jobs:
       - name: Collect submission artifact
         run: |
           mkdir -p submissions_out
-          latest=$(ls -dt submissions/submission_* | head -n1)
-          cp $latest/*.csv submissions_out/submission.csv || true
+          latest=$(ls -dt submissions/submission_* 2>/dev/null | head -n1 || true)
+          if [ -n "$latest" ]; then
+            cp "$latest"/*.csv submissions_out/submission.csv || true
+          else
+            echo "No submissions found."
+          fi
 
       - name: Upload submission artifact
         uses: actions/upload-artifact@v4
@@ -65,16 +87,14 @@ jobs:
           if-no-files-found: warn
 
       - name: Commit submission back to repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          latest=$(ls -dt submissions/submission_* | head -n1)
+          latest=$(ls -dt submissions/submission_* 2>/dev/null | head -n1 || true)
           if [ -d "$latest" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add $latest
-            git commit -m "Add submission: $(basename $latest)" || echo "Nothing to commit"
+            git add "$latest"
+            git commit -m "Add submission: $(basename "$latest")" || echo "Nothing to commit"
             git push
           else
             echo "No submission folder found to commit."

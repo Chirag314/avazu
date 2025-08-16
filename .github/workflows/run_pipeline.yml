@@ -5,22 +5,12 @@ on:
   push:
     branches: [ "main" ]
   schedule:
-    - cron: "0 7 * * 1"  # Mondays at 07:00 UTC
+    - cron: "0 7 * * 1"
 
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-
-    # ✅ Define secrets once here; steps inherit them (VS Code warnings go away)
-    env:
-      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
-      WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }} # optional
-
-    permissions:
-      contents: write   # needed for committing submission back to repo
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,43 +31,39 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Configure Kaggle
+      - name: Verify Kaggle secrets
         run: |
-          if [[ -z "${KAGGLE_USERNAME:-}" || -z "${KAGGLE_KEY:-}" ]]; then
-            echo "❌ Kaggle secrets not set; exiting."
+          if [ -z "${{ secrets.KAGGLE_USERNAME }}" ] || [ -z "${{ secrets.KAGGLE_KEY }}" ]; then
+            echo "KAGGLE secrets missing. Add KAGGLE_USERNAME and KAGGLE_KEY in repo secrets."
             exit 1
           fi
-          mkdir -p ~/.kaggle
-          printf '{"username":"%s","key":"%s"}' "$KAGGLE_USERNAME" "$KAGGLE_KEY" > ~/.kaggle/kaggle.json
-          chmod 600 ~/.kaggle/kaggle.json
 
-      - name: Download Kaggle data
+      - name: Configure Kaggle
         run: |
-          pip install kaggle
-          mkdir -p data
-          kaggle competitions download -c neurips-2025-open-polymer-prediction -p data
-          shopt -s nullglob
-          for z in data/*.zip; do
-            echo "Unzipping $z"
-            unzip -o "$z" -d data
-          done
+          mkdir -p ~/.kaggle
+          printf '{"username":"%s","key":"%s"}' "${{ secrets.KAGGLE_USERNAME }}" "${{ secrets.KAGGLE_KEY }}" > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+          kaggle competitions list | head -n 5 || true
 
-      - name: Run pipeline (sample fraction on CI)
+      - name: Run pipeline (CI-fast)
         env:
           TRAIN_SAMPLE_FRACTION: "0.02"
           HASH_BINS: "262144"
         run: |
+          set -xe
           python main.py --data_dir data --train --infer
 
       - name: Collect submission artifact
         run: |
           mkdir -p submissions_out
           latest=$(ls -dt submissions/submission_* 2>/dev/null | head -n1 || true)
-          if [ -n "$latest" ]; then
-            cp "$latest"/*.csv submissions_out/submission.csv || true
-          else
-            echo "No submissions found."
+          if [ -d "$latest" ]; then
+            # prefer .csv.gz if you enabled compression
+            gz=$(ls "$latest"/*.gz 2>/dev/null | head -n1 || true)
+            csv=$(ls "$latest"/*.csv 2>/dev/null | head -n1 || true)
+            cp "${gz:-$csv}" submissions_out/submission.csv || true
           fi
+          ls -l submissions_out || true
 
       - name: Upload submission artifact
         uses: actions/upload-artifact@v4
@@ -86,15 +72,15 @@ jobs:
           path: submissions_out/submission.csv
           if-no-files-found: warn
 
-      - name: Commit submission back to repo
+      - name: Submit to Kaggle
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
-          set -e
-          latest=$(ls -dt submissions/submission_* 2>/dev/null | head -n1 || true)
-          if [ -d "$latest" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add "$latest"
-            git commit -m "Add submission: $(basename "$latest")" || echo "Nothing to commit"
-            git push
+          if [ -f submissions_out/submission.csv ]; then
+            kaggle competitions submit -c avazu-ctr-prediction \
+              -f submissions_out/submission.csv \
+              -m "CI auto submit $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           else
-            echo "No submission folder found to commit."
+            echo "No submission file to submit."
+          fi

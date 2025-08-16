@@ -1,60 +1,65 @@
-name: Update README with W&B Leaderboard
+name: Update README Leaderboard
 
 on:
-  workflow_dispatch:
-  workflow_run:
-    workflows: ["Run W&B Sweep (PySpark Avazu)"]
-    types:
-      - completed
+  workflow_dispatch: {}       # allow manual runs
+  schedule:
+    - cron: "0 12 * * *"      # run daily at 12:00 UTC (optional)
 
 jobs:
-  update-readme:
+  update:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
+      # (Optional) Download the latest submission artifact from the latest run of the pipeline workflow
+      # You can't pull cross-workflow artifacts directly without extra APIs;
+      # simplest is to query Kaggle directly or skip if unavailable.
 
-      - name: Install deps
+      - name: Ensure Kaggle secrets
+        if: ${{ !secrets.KAGGLE_USERNAME || !secrets.KAGGLE_KEY }}
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          echo "Kaggle secrets missing; skipping leaderboard update." && exit 0
 
-      - name: Login to W&B
-        env:
-          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+      - name: Install Kaggle
+        run: pip install kaggle
+
+      - name: Create kaggle.json
         run: |
-          python - << 'PY'
-import os, wandb
-assert os.getenv("WANDB_API_KEY"), "WANDB_API_KEY not set"
-wandb.login(key=os.environ["WANDB_API_KEY"])
-print("Logged into W&B")
+          mkdir -p ~/.kaggle
+          printf '{"username":"%s","key":"%s"}' "${{ secrets.KAGGLE_USERNAME }}" "${{ secrets.KAGGLE_KEY }}" > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: Update README with leaderboard info
+        run: |
+          # Example: query competition info; adjust to your comp and format
+          kaggle competitions submissions -c avazu-ctr-prediction --page 1 --csv > latest_submissions.csv || true
+          python - <<'PY'
+import pandas as pd, os, re
+from datetime import datetime, timezone
+if os.path.exists("latest_submissions.csv"):
+    df = pd.read_csv("latest_submissions.csv")
+    md = ["## Latest Kaggle Submissions", "", df.head(10).to_markdown(index=False), "", f"_Updated: {datetime.now(timezone.utc).isoformat()}_"]
+else:
+    md = ["## Latest Kaggle Submissions", "", "_No submissions found or Kaggle API query failed._"]
+readme = "README.md"
+txt = open(readme, "r", encoding="utf-8").read() if os.path.exists(readme) else ""
+# Replace a block between markers or append
+start = "<!-- LEADERBOARD_START -->"
+end = "<!-- LEADERBOARD_END -->"
+block = start + "\n" + "\n".join(md) + "\n" + end
+if start in txt and end in txt:
+    txt = re.sub(f"{start}[\\s\\S]*?{end}", block, txt)
+else:
+    txt += "\n\n" + block + "\n"
+open(readme, "w", encoding="utf-8").write(txt)
 PY
-
-      - name: Build leaderboard CSV from W&B
-        env:
-          WANDB_ENTITY: ${{ secrets.WANDB_ENTITY }}
-          WANDB_PROJECT: ${{ secrets.WANDB_PROJECT }}
-        run: |
-          python leaderboard/build_leaderboard.py --entity "$WANDB_ENTITY" --project "$WANDB_PROJECT" --tag avazu_sweep --out leaderboard/leaderboard.csv
-
-      - name: Insert leaderboard block into README
-        env:
-          WANDB_ENTITY: ${{ secrets.WANDB_ENTITY }}
-          WANDB_PROJECT: ${{ secrets.WANDB_PROJECT }}
-        run: |
-          python tools/insert_leaderboard.py
-
-      - name: Commit README changes
+      - name: Commit README change
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add README.md leaderboard/leaderboard.csv
-          git commit -m "Auto-embed W&B leaderboard into README" || echo "Nothing to commit"
-          git push
+          git add README.md || true
+          git diff --quiet && echo "No changes" || git commit -m "Update leaderboard in README"
+          git push || true

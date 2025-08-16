@@ -1,20 +1,14 @@
-name: Run W&B Sweep (PySpark Avazu)
+name: W&B Sweep
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 jobs:
   sweep:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    if: ${{ secrets.WANDB_API_KEY != '' }}  # don’t run if secret missing
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "11"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -24,65 +18,18 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt wandb
 
-      - name: Configure Kaggle
-        env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
-        run: |
-          mkdir -p ~/.kaggle
-          printf '{"username":"%s","key":"%s"}' "$KAGGLE_USERNAME" "$KAGGLE_KEY" > ~/.kaggle/kaggle.json
-          chmod 600 ~/.kaggle/kaggle.json
-
-      - name: Login to W&B
+      - name: Login W&B
         env:
           WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
         run: |
-          python - << 'PY'
-import os, wandb
-assert os.getenv("WANDB_API_KEY"), "WANDB_API_KEY not set"
+          python - <<'PY'
+import wandb, os
 wandb.login(key=os.environ["WANDB_API_KEY"])
-print("Logged into W&B")
+print("W&B logged in")
 PY
 
-      - name: Create sweep
-        id: createsweep
-        env:
-          WANDB_ENTITY: ${{ secrets.WANDB_ENTITY }}
-          WANDB_PROJECT: ${{ secrets.WANDB_PROJECT }}
+      - name: Run sweep (example)
         run: |
-          set -e
-          out=$(wandb sweep --entity "$WANDB_ENTITY" --project "$WANDB_PROJECT" sweeps/sweep.yaml | tee /dev/stderr)
-          echo "$out" | grep -Eo '([a-z0-9]+/[a-z0-9]+)' | tail -n1 > sweep_id.txt
-          echo "SWEEP_ID=$(cat sweep_id.txt)" >> $GITHUB_OUTPUT
-          echo "Sweep ID: $(cat sweep_id.txt)"
-
-      - name: Run agents
-        env:
-          SWEEP_ID: ${{ steps.createsweep.outputs.SWEEP_ID }}
-        run: |
-          wandb agent --count 8 "$SWEEP_ID"
-
-      - name: Build leaderboard CSV
-        env:
-          WANDB_ENTITY: ${{ secrets.WANDB_ENTITY }}
-          WANDB_PROJECT: ${{ secrets.WANDB_PROJECT }}
-        run: |
-          python leaderboard/build_leaderboard.py --entity "$WANDB_ENTITY" --project "$WANDB_PROJECT" --tag avazu_sweep --out leaderboard/leaderboard.csv
-
-      - name: Upload leaderboard artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wandb-leaderboard
-          path: leaderboard/leaderboard.csv
-
-      - name: Commit leaderboard to repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add leaderboard/leaderboard.csv
-          git commit -m "Update leaderboard from W&B sweep" || echo "Nothing to commit"
-          git push
+          python scripts/run_sweep.py  # your sweep launcher

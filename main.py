@@ -2,6 +2,8 @@
 import argparse
 from datetime import datetime
 from pathlib import Path
+import tempfile
+import sys
 
 from pyspark.sql import SparkSession
 from pyspark.ml import PipelineModel  # used when loading saved model
@@ -13,41 +15,139 @@ from inference import run_inference
 
 logger = get_logger(__name__)
 
+# ======================================================================
+# Windows Hadoop bootstrap: ensure winutils.exe + hadoop.dll are present
+# ======================================================================
 
-# --- Windows Spark bootstrap (avoid HADOOP_HOME error) ---
-def ensure_windows_hadoop() -> None:
-    """Configure HADOOP_HOME/winutils on Windows to prevent Spark errors."""
-    if os.name != "nt":  # only on Windows
+HADOOP_VERSION = "3.3.6"  # works with Spark 3.x in most PySpark wheels
+HADOOP_BASE = r"C:\hadoop"
+HADOOP_BIN = Path(HADOOP_BASE) / "bin"
+WINUTILS_URL = f"https://github.com/cdarlint/winutils/raw/master/hadoop-{HADOOP_VERSION}/bin/winutils.exe"
+HADOOP_DLL_URL = f"https://github.com/cdarlint/winutils/raw/master/hadoop-{HADOOP_VERSION}/bin/hadoop.dll"
+
+
+def _download_file(url: str, dest: Path) -> None:
+    import urllib.request
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Downloading {url} -> {dest}")
+    with urllib.request.urlopen(url) as r, open(dest, "wb") as f:
+        f.write(r.read())
+
+
+def ensure_hadoop_binaries() -> None:
+    """Make sure C:\\hadoop\\bin has winutils.exe and hadoop.dll.
+    If missing, fetch from cdarlint/winutils (Hadoop {HADOOP_VERSION}).
+    """
+    if os.name != "nt":
         return
-    hadoop_home = os.environ.get("HADOOP_HOME") or r"C:\hadoop"
-    winutils = Path(hadoop_home) / "bin" / "winutils.exe"
+    winutils = HADOOP_BIN / "winutils.exe"
+    hadoop_dll = HADOOP_BIN / "hadoop.dll"
+
+    missing = []
     if not winutils.exists():
-        print(
-            "⚠️ winutils.exe not found. Create C:\\hadoop\\bin and place winutils.exe there."
-        )
-        return
+        missing.append(("winutils.exe", WINUTILS_URL, winutils))
+    if not hadoop_dll.exists():
+        missing.append(("hadoop.dll", HADOOP_DLL_URL, hadoop_dll))
 
-    os.environ.setdefault("HADOOP_HOME", hadoop_home)
-    os.environ.setdefault("hadoop.home.dir", hadoop_home)
-    os.environ.setdefault("SPARK_LOCAL_DIRS", r"C:\tmp\spark")
+    if missing:
+        logger.warning(
+            "Some Hadoop Windows binaries are missing; attempting to download..."
+        )
+        for name, url, dest in missing:
+            try:
+                _download_file(url, dest)
+            except Exception as e:
+                logger.error(f"Failed to download {name} from {url}: {e}")
+                logger.error(
+                    "You can also download manually from: "
+                    f"https://github.com/cdarlint/winutils/tree/master/hadoop-{HADOOP_VERSION}/bin "
+                    "and place files in C:\\hadoop\\bin"
+                )
+                raise
+
+    # Add env and DLL search path
+    os.environ.setdefault("HADOOP_HOME", HADOOP_BASE)
+    os.environ.setdefault("hadoop.home.dir", HADOOP_BASE)
+    try:
+        os.add_dll_directory(str(HADOOP_BIN))  # Python 3.8+
+    except Exception as e:
+        logger.warning(f"Could not add DLL dir {HADOOP_BIN}: {e}")
+
+    # Preload hadoop.dll (fail early if incompatible)
+    try:
+        from ctypes import WinDLL
+
+        WinDLL(str(HADOOP_BIN / "hadoop.dll"))
+        print(f"✅ hadoop.dll loaded from {HADOOP_BIN}")
+    except Exception as e:
+        print(
+            "❌ Cannot load hadoop.dll. Ensure it matches your Spark Hadoop version and is 64-bit."
+        )
+        print(f"   Looked in: {HADOOP_BIN}")
+        raise
+
+
+def ensure_windows_hadoop() -> None:
+    """Create temp dirs + ensure binaries; keep for compatibility."""
+    if os.name != "nt":
+        return
+    # Ensure binaries first (download if needed)
+    ensure_hadoop_binaries()
+
+    # Ensure temp dirs
     Path(r"C:\tmp\spark").mkdir(parents=True, exist_ok=True)
     Path(r"C:\tmp\hive").mkdir(parents=True, exist_ok=True)
-    print(f"✅ Using winutils at: {winutils}")
+    print("✅ Windows Hadoop bootstrap done.")
+
+
+# Run bootstrap early
+ensure_windows_hadoop()
 
 
 def spark_session(
-    app_name: str = "AvazuPySpark", driver_mem: str = "6g"
+    app_name: str = "AvazuPySpark", driver_mem: str = "12g"
 ) -> SparkSession:
+    # robust local dirs
+    local_tmp = (
+        Path(r"C:\tmp\spark")
+        if os.name == "nt"
+        else Path(tempfile.gettempdir()) / "spark"
+    )
+    local_tmp.mkdir(parents=True, exist_ok=True)
+    warehouse_dir = local_tmp / "warehouse"
+    warehouse_dir.mkdir(parents=True, exist_ok=True)
+
     spark = (
         SparkSession.builder.appName(app_name)
         .master(os.environ.get("SPARK_MASTER", "local[*]"))
         .config(
             "spark.driver.memory", os.environ.get("SPARK_DRIVER_MEMORY", driver_mem)
         )
+        # size/time safety:
+        .config("spark.driver.maxResultSize", "2g")
+        .config("spark.sql.shuffle.partitions", "64")
+        .config("spark.default.parallelism", "64")
+        .config("spark.network.timeout", "800s")
+        .config("spark.executor.heartbeatInterval", "60s")
+        # Windows/Hadoop friction reducers:
+        .config("spark.hadoop.io.native.lib.available", "false")
+        .config("spark.hadoop.native.lib", "false")  # older key some builds still honor
+        .config("spark.hadoop.fs.file.impl", "org.apache.hadoop.fs.LocalFileSystem")
         .config(
-            "spark.sql.shuffle.partitions",
-            os.environ.get("SPARK_SHUFFLE_PARTITIONS", "200"),
+            "spark.hadoop.fs.AbstractFileSystem.file.impl",
+            "org.apache.hadoop.fs.local.LocalFs",
         )
+        .config("mapreduce.fileoutputcommitter.algorithm.version", "2")
+        .config("mapreduce.fileoutputcommitter.cleanup-failures.ignored", "true")
+        .config("spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version", "2")
+        .config(
+            "spark.hadoop.mapreduce.fileoutputcommitter.cleanup-failures.ignored",
+            "true",
+        )
+        # local dirs:
+        .config("spark.sql.warehouse.dir", str(warehouse_dir))
+        .config("spark.local.dir", str(local_tmp))
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
@@ -61,7 +161,6 @@ def maybe_download_kaggle(data_dir: str) -> None:
     """
     train_gz = os.path.join(data_dir, "train.gz")
     test_gz = os.path.join(data_dir, "test.gz")
-    _sample_gz = os.path.join(data_dir, "sampleSubmission.gz")  # not used by code path
 
     if os.path.exists(train_gz) and os.path.exists(test_gz):
         logger.info("Kaggle data already present.")
@@ -70,12 +169,21 @@ def maybe_download_kaggle(data_dir: str) -> None:
     os.makedirs(data_dir, exist_ok=True)
     logger.info("Attempting to download dataset from Kaggle...")
     cmd = f'kaggle competitions download -c avazu-ctr-prediction -p "{data_dir}"'
-    os.system(cmd)
+    code = os.system(cmd)
+    if code != 0:
+        logger.error(
+            "Kaggle download failed (non-zero exit). Ensure KAGGLE_USERNAME/KAGGLE_KEY are set."
+        )
     # Spark can read .gz directly; no unzip needed
 
 
+def _abs_uri(p: Path) -> str:
+    """Convert a Path to a Windows-safe absolute file:/// URI."""
+    return "file:///" + str(p.resolve()).replace("\\", "/")
+
+
 def main() -> None:
-    ensure_windows_hadoop()  # safe to call on all platforms
+    # ensure_windows_hadoop() already called above, safe on all platforms
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -103,10 +211,23 @@ def main() -> None:
 
     spark = spark_session()
 
+    # Quick FS sanity: Parquet write (isolates FS issues early)
+    tmp_check = Path("artifacts/tmp_check")
+    tmp_check_uri = _abs_uri(tmp_check)
+    spark.range(5).write.mode("overwrite").parquet(tmp_check_uri)
+    logger.info(f"✅ Parquet write test OK at {tmp_check_uri}")
+
     train_path = os.path.join(data_dir, "train.gz")
     test_path = os.path.join(data_dir, "test.gz")
 
+    # Build absolute model URI
+    model_root = Path("artifacts/model")
+    model_root.mkdir(parents=True, exist_ok=True)
+    model_uri = _abs_uri(model_root)
+
+    saved_ok = False
     model = None
+
     if args.train:
         model, metrics = train_model(
             spark,
@@ -116,22 +237,33 @@ def main() -> None:
         )
         logger.info(f"Metrics: {metrics}")
 
-        # Save model
-        model_dir = "artifacts/model"
-        model.write().overwrite().save(model_dir)
-        logger.info(f"Saved model to {model_dir}")
+        # Try save; continue even if save fails on Windows
+        try:
+            if not isinstance(model, PipelineModel):
+                raise TypeError(f"Expected PipelineModel, got {type(model)}")
+            model.write().overwrite().save(model_uri)
+            logger.info(f"Saved model to {model_uri}")
+            saved_ok = True
+        except Exception as e:
+            logger.error(
+                "❌ Spark model save failed; proceeding without saving.", exc_info=True
+            )
 
     if args.infer:
-        if model is None:
-            model_dir = "artifacts/model"
-            logger.info(f"Loading model from {model_dir}")
-            model = PipelineModel.load(model_dir)
+        if not saved_ok:
+            # Try loading from disk; if unavailable, use in-memory model
+            if model is None:
+                logger.info(f"Loading model from {model_uri}")
+                model = PipelineModel.load(model_uri)
 
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        out_dir = f"submissions/submission_{ts}"
-        os.makedirs("submissions", exist_ok=True)
-        run_inference(model, spark, test_path=test_path, out_path=out_dir)
-        logger.info(f"Submission written to {out_dir}")
+        out_dir = Path(f"submissions/submission_{ts}")
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        run_inference(
+            model, spark, test_path=test_path, out_path=str(out_dir.resolve())
+        )
+        logger.info(f"Submission written to {out_dir.resolve()}")
 
     spark.stop()
 

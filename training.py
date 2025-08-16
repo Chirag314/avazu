@@ -9,8 +9,15 @@ from feature_engineering import build_feature_pipeline, prepare_dataframe
 
 logger = get_logger(__name__)
 
+
 @log_exceptions(logger)
-def train_model(spark, train_path: str, sample_fraction: float = 0.05, seed: int = 42, hash_bins: int = 2**18) -> Tuple[PipelineModel, dict]:
+def train_model(
+    spark,
+    train_path: str,
+    sample_fraction: float = 0.05,
+    seed: int = 42,
+    hash_bins: int = 2**16,
+) -> Tuple[PipelineModel, dict]:
     """Train a logistic regression CTR model on Avazu with optional sampling.\n
     Args:\n
       spark: SparkSession\n
@@ -39,31 +46,37 @@ def train_model(spark, train_path: str, sample_fraction: float = 0.05, seed: int
     neg = train_df.filter(F.col("label") == 0.0).count()
     balance_ratio = neg / max(pos, 1)
     logger.info(f"Class balance: pos={pos}, neg={neg}, ratio={balance_ratio:.3f}")
-    train_df = train_df.withColumn("classWeightCol", F.when(F.col("label") == 1.0, balance_ratio).otherwise(1.0))
+    train_df = train_df.withColumn(
+        "classWeightCol", F.when(F.col("label") == 1.0, balance_ratio).otherwise(1.0)
+    )
 
     pipeline = build_feature_pipeline(hash_bins=hash_bins)
 
     lr = LogisticRegression(
         featuresCol="features",
         labelCol="label",
-        maxIter=20,
-        regParam=0.1,
+        maxIter=50,
+        regParam=0.001,
         elasticNetParam=0.0,
+        aggregationDepth=2,
         weightCol="classWeightCol",
         probabilityCol="probability",
         rawPredictionCol="rawPrediction",
-        predictionCol="prediction"
+        predictionCol="prediction",
     )
 
     full_pipeline = PipelineModel(stages=pipeline.getStages()).copy()
     # Fit has to be on a Pipeline, not PipelineModel, so rebuild cleanly:
     from pyspark.ml import Pipeline
+
     full = Pipeline(stages=[*pipeline.getStages(), lr])
 
     logger.info("Fitting model...")
     model = full.fit(train_df)
 
-    evaluator = BinaryClassificationEvaluator(labelCol="label", rawPredictionCol="rawPrediction", metricName="areaUnderROC")
+    evaluator = BinaryClassificationEvaluator(
+        labelCol="label", rawPredictionCol="rawPrediction", metricName="areaUnderROC"
+    )
     val_pred = model.transform(val_df)
     auc = evaluator.evaluate(val_pred)
 
